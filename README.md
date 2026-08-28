@@ -8,11 +8,26 @@ footage onto disk.
 - **Rehouse Used** — walks every "main comp" (a `CompItem` sitting directly in the
   `001 Comps` panel folder), files precomps and footage into the standard panel/disk
   layout, and consolidates footage living outside the project's own `Assets/` tree by
-  copying it in and relinking.
-- **Remove Unused** — deletes anything unreachable from a main comp from the project
-  panel only. Never touches a file on disk.
+  copying it in and relinking. With **Reorganize legacy folders** checked, it also
+  finds comps/footage sitting in any other top-level folder (e.g. leftover `Comps`,
+  `Pre comps`, `Assets` folders from an imported project) and files them into the
+  standard structure — comps always go to `002 Pre Comps` (never `001 Comps`; main-comp
+  status is only ever granted by manually placing a comp in `001 Comps`), footage is
+  bucketed by type. Comps that land in `002 Pre Comps` this way and turn out to be
+  unused get caught by the next Remove Unused pass.
+- **Remove Unused from Project** — deletes anything unreachable from a main comp from
+  the project panel, regardless of where its file lives. Never touches disk.
+- **Remove Unused from Disk** — deletes the underlying file for any unreachable footage
+  item AND removes it from the project panel, but only for files that live inside the
+  current project's own folder. Anything unreachable that isn't a project-folder
+  footage file (a comp, or footage still pointing at an imported project's folder) is
+  left completely untouched — that source project owns those files, and this tool's
+  convention is to copy such footage in (Rehouse Used) rather than delete it out from
+  under the other project.
 - **Fix Broken Links** — re-finds offline footage anywhere under the project folder by
   filename and relinks it, without touching disk.
+- **Add Main Comps Folder** — creates the `001 Comps` panel folder (if it doesn't
+  already exist) so you can drop your main comps into it before running Rehouse Used.
 
 Convention it enforces:
 

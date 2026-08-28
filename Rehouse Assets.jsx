@@ -242,16 +242,6 @@
             }
             return parts.join(" / ");
         },
-        // Path of a folder ITSELF (including its own name), for display of a move target.
-        folderFullPath: function (folderItem) {
-            var parts = [], f = folderItem, guard = 0;
-            while (f && f.id !== app.project.rootFolder.id && guard < 32) {
-                parts.unshift(f.name);
-                f = U.safe(function () { return f.parentFolder; }, null);
-                guard++;
-            }
-            return parts.join(" / ");
-        },
         sourceKind: function (item) {
             var src = U.safe(function () { return item.mainSource; }, null);
             if (!src) return "unknown";
@@ -265,6 +255,40 @@
         },
         itemFile: function (item) { return U.safe(function () { return item.file; }, null); }
     };
+
+    // -------------------------------------------------------------- FolderSpec
+    // A FolderSpec describes where an item should end up WITHOUT touching the project — it's just
+    // { parent, name }. Planning (buildRehousePlan, called on Preview) only ever builds and compares
+    // specs; resolveFolderSpec, which actually creates the folders via Proj.ensureFolder, is called
+    // exclusively from Exec at Apply time. This is what keeps Preview 100% read-only: no panel
+    // folder gets created — nothing changes in the project at all — until Apply is pressed.
+
+    var ROOT_SPEC = { parent: null, name: null, isRoot: true };
+    function folderSpec(parent, name) { return { parent: parent, name: name, isRoot: false }; }
+
+    function specPath(spec) {
+        if (!spec || spec.isRoot) return "";
+        var parentPath = specPath(spec.parent);
+        return parentPath ? (parentPath + " / " + spec.name) : spec.name;
+    }
+
+    function resolveFolderSpec(spec, cache) {
+        if (spec.isRoot) return app.project.rootFolder;
+        var key = specPath(spec);
+        if (cache && cache[key]) return cache[key];
+        var parentFolder = resolveFolderSpec(spec.parent, cache);
+        var resolved = Proj.ensureFolder(parentFolder, spec.name);
+        if (cache) cache[key] = resolved;
+        return resolved;
+    }
+
+    var COMPS_SPEC = folderSpec(ROOT_SPEC, CFG.panel.comps);
+    var PRECOMPS_SPEC = folderSpec(ROOT_SPEC, CFG.panel.precomps);
+    var ASSETS_SPEC = folderSpec(ROOT_SPEC, CFG.panel.assets);
+    var IMPORTS_SPEC = folderSpec(ROOT_SPEC, CFG.panel.imports);
+    var SHARED_SPEC = folderSpec(PRECOMPS_SPEC, CFG.panel.shared);
+    var BUCKET_SPECS = {};
+    U.each(CFG.buckets, function (b) { BUCKET_SPECS[b.key] = folderSpec(ASSETS_SPEC, b.aeName); });
 
     // ------------------------------------------------------------------- Seq
 
@@ -458,6 +482,66 @@
         return s;
     }
 
+    function footageBucketKeyFor(item) {
+        var srcKind = Proj.sourceKind(item);
+        if (srcKind === "file") {
+            var f = Proj.itemFile(item);
+            return f ? Classify.bucketForExt(Fs.extOf(Fs.baseName(f))).key : "other";
+        }
+        if (srcKind === "missing") {
+            var mp = U.safe(function () { return item.mainSource.missingFootagePath; }, "");
+            return Classify.bucketForExt(Fs.extOf((mp.split("/").pop() || ""))).key;
+        }
+        return "other";
+    }
+
+    // Declared (not a self-referencing named function expression) — ExtendScript's JS engine is
+    // unreliable resolving a NFE's own name inside its body, so recursion here always goes through
+    // a plain top-level function, matching the walk() in Locate.buildFileIndex.
+    function walkLegacyFolder(folder, depth, ctx, moves) {
+        if (depth > 24) return;
+        var cn = U.safe(function () { return folder.numItems; }, 0);
+        for (var j = 1; j <= cn; j++) {
+            var child = U.safe(function () { return folder.item(j); }, null);
+            if (!child) continue;
+            if (child instanceof FolderItem) { walkLegacyFolder(child, depth + 1, ctx, moves); continue; }
+            if (ctx.graph.reach.has(child.id)) continue; // already handled by the reachability-based mover
+            if (child instanceof CompItem) {
+                moves.push({ item: child, itemName: child.name, kind: "comp", targetFolder: PRECOMPS_SPEC, fromPath: Proj.folderPathOf(child), legacy: true });
+            } else if (child instanceof FootageItem) {
+                var target = BUCKET_SPECS[footageBucketKeyFor(child)];
+                moves.push({ item: child, itemName: child.name, kind: "footage", targetFolder: target, fromPath: Proj.folderPathOf(child), legacy: true });
+            }
+        }
+    }
+
+    // Finds every comp/footage item sitting in a non-canonical top-level folder and proposes a
+    // panel move into the standard structure. Comps ALWAYS go to the pre comps folder, never the
+    // main comps folder — main-comp status is only ever granted by the user manually placing a
+    // comp in 001 Comps (see "Add Main Comps Folder"). This way, a legacy comp that turns out to be
+    // unused stays out of 001 Comps and is caught by the next Remove Unused pass instead of being
+    // mistaken for a main comp. Footage is bucketed by type. Only items NOT already reachable from
+    // a main comp are proposed here; reachable ones are already handled by the graph-driven moves
+    // in buildRehousePlan, which also does the real disk consolidation.
+    function buildFolderConsolidationMoves(ctx) {
+        var canonicalIds = U.newSet();
+        U.each([ctx.compsFolder, ctx.precompsFolder, ctx.assetsFolder, ctx.importsFolder], function (f) {
+            if (f) canonicalIds.add(f.id);
+        });
+
+        var root = app.project.rootFolder;
+        var n = U.safe(function () { return root.numItems; }, 0);
+        var legacyFolders = [];
+        for (var i = 1; i <= n; i++) {
+            var it = U.safe(function () { return root.item(i); }, null);
+            if (it && it instanceof FolderItem && !canonicalIds.has(it.id)) legacyFolders.push(it);
+        }
+
+        var moves = [];
+        U.each(legacyFolders, function (folder) { walkLegacyFolder(folder, 0, ctx, moves); });
+        return moves;
+    }
+
     function findMainCompById(mainComps, idStr) {
         var id = parseInt(idStr, 10);
         for (var i = 0; i < mainComps.length; i++) if (mainComps[i].id === id) return mainComps[i];
@@ -545,6 +629,10 @@
     // --------------------------------------------------------------- Planner
     // Pure: reads the project and the filesystem, writes nothing. All mutation happens in Exec.
 
+    // Never creates anything — the canonical panel folders are only looked up (null if they don't
+    // exist yet). This is what keeps every Preview button, including Rehouse Used, from touching
+    // the project until Apply is pressed; see FolderSpec above for how planning still works without
+    // the real folders existing.
     function buildContext() {
         if (!app.project.file) {
             return { error: "Save your project first — the project's own folder is where Assets/ and Renders/ get created." };
@@ -557,18 +645,20 @@
         U.each(CFG.buckets, function (b) { bucketDiskFolders[b.key] = Fs.childFolder(assetsRootDisk, b.diskName); });
 
         var root = app.project.rootFolder;
-        var compsFolder = Proj.ensureFolder(root, CFG.panel.comps);
-        var precompsFolder = Proj.ensureFolder(root, CFG.panel.precomps);
-        var assetsFolder = Proj.ensureFolder(root, CFG.panel.assets);
+        var compsFolder = Proj.findChildFolder(root, CFG.panel.comps);
+        var precompsFolder = Proj.findChildFolder(root, CFG.panel.precomps);
+        var assetsFolder = Proj.findChildFolder(root, CFG.panel.assets);
         var bucketAEFolders = {};
-        U.each(CFG.buckets, function (b) { bucketAEFolders[b.key] = Proj.ensureFolder(assetsFolder, b.aeName); });
-        var importsFolder = Proj.ensureFolder(root, CFG.panel.imports);
+        U.each(CFG.buckets, function (b) { bucketAEFolders[b.key] = assetsFolder ? Proj.findChildFolder(assetsFolder, b.aeName) : null; });
+        var importsFolder = Proj.findChildFolder(root, CFG.panel.imports);
 
         var mainComps = [];
-        var nMain = U.safe(function () { return compsFolder.numItems; }, 0);
-        for (var i = 1; i <= nMain; i++) {
-            var it = U.safe(function () { return compsFolder.item(i); }, null);
-            if (it && it instanceof CompItem) mainComps.push(it);
+        if (compsFolder) {
+            var nMain = U.safe(function () { return compsFolder.numItems; }, 0);
+            for (var i = 1; i <= nMain; i++) {
+                var it = U.safe(function () { return compsFolder.item(i); }, null);
+                if (it && it instanceof CompItem) mainComps.push(it);
+            }
         }
 
         var graph = Graph.build(mainComps);
@@ -613,21 +703,21 @@
             var item = ctx.graph.precompsMap.get(idStr);
             var ownerSet = ctx.graph.owners.get(idStr);
             var ownerIds = ownerSet ? ownerSet.keys() : [];
-            var targetFolder;
+            var targetSpec;
             if (opts.precompFolders) {
                 if (ownerIds.length >= 2) {
-                    targetFolder = Proj.ensureFolder(ctx.precompsFolder, CFG.panel.shared);
+                    targetSpec = SHARED_SPEC;
                 } else {
                     var ownerComp = findMainCompById(ctx.mainComps, ownerIds[0]);
                     var name = sanitizeFolderName(ownerComp ? ownerComp.name : ("Comp " + ownerIds[0]));
-                    targetFolder = Proj.ensureFolder(ctx.precompsFolder, name);
+                    targetSpec = folderSpec(PRECOMPS_SPEC, name);
                 }
             } else {
-                targetFolder = ctx.precompsFolder;
+                targetSpec = PRECOMPS_SPEC;
             }
-            var curParentId = U.safe(function () { return item.parentFolder.id; }, -1);
-            if (curParentId !== targetFolder.id) {
-                plan.panelMoves.push({ item: item, itemName: item.name, kind: "comp", targetFolder: targetFolder, fromPath: Proj.folderPathOf(item) });
+            var curPath = Proj.folderPathOf(item);
+            if (curPath !== specPath(targetSpec)) {
+                plan.panelMoves.push({ item: item, itemName: item.name, kind: "comp", targetFolder: targetSpec, fromPath: curPath });
             }
             checkProxyWarning(item, plan);
         });
@@ -646,9 +736,8 @@
                 var missingPath = U.safe(function () { return item.mainSource.missingFootagePath; }, "");
                 var extM = Fs.extOf(missingPath.split("/").pop() || "");
                 var bucketM = Classify.bucketForExt(extM);
-                var targetM = ctx.bucketAEFolders[bucketM.key];
-                var curM = U.safe(function () { return item.parentFolder.id; }, -1);
-                if (curM !== targetM.id) {
+                var targetM = BUCKET_SPECS[bucketM.key];
+                if (Proj.folderPathOf(item) !== specPath(targetM)) {
                     plan.panelMoves.push({ item: item, itemName: item.name, kind: "footage", targetFolder: targetM, fromPath: Proj.folderPathOf(item) });
                 }
                 plan.warnings.push(item.name + " — footage is offline (" + missingPath + "); filed by extension, not consolidated.");
@@ -660,9 +749,8 @@
             if (!f) { plan.skips.push({ itemName: item.name, reason: "no file reference" }); return; }
             var ext = Fs.extOf(Fs.baseName(f));
             var bucket = Classify.bucketForExt(ext);
-            var targetAEFolder = ctx.bucketAEFolders[bucket.key];
-            var curId = U.safe(function () { return item.parentFolder.id; }, -1);
-            if (curId !== targetAEFolder.id) {
+            var targetAEFolder = BUCKET_SPECS[bucket.key];
+            if (Proj.folderPathOf(item) !== specPath(targetAEFolder)) {
                 plan.panelMoves.push({ item: item, itemName: item.name, kind: "footage", targetFolder: targetAEFolder, fromPath: Proj.folderPathOf(item) });
             }
 
@@ -720,6 +808,11 @@
 
         U.each(ctx.mainComps, function (c) { checkProxyWarning(c, plan); });
 
+        if (opts.consolidateFolders) {
+            var legacyMoves = buildFolderConsolidationMoves(ctx);
+            U.each(legacyMoves, function (m) { plan.panelMoves.push(m); });
+        }
+
         var totalBytes = 0, copyCount = 0;
         U.each(plan.diskCopies, function (c) { if (!c.reuse) { totalBytes += c.bytes; copyCount++; } });
         plan.totals = {
@@ -729,23 +822,68 @@
         return plan;
     }
 
-    function buildRemovePlan(ctx, opts) {
-        var plan = { kind: "remove", removals: [], skips: [], stampNumItems: ctx.stampNumItems, stampAep: ctx.stampAep };
+    function findUnusedItems(ctx, opts) {
         var protectedNames = opts.protectExpressions ? scanExpressionReferences() : U.newSet();
-
-        var allItems = Proj.snapshotItems();
-        U.each(allItems, function (item) {
+        var found = [], skips = [];
+        U.each(Proj.snapshotItems(), function (item) {
             if (item instanceof FolderItem) return;
             if (!(item instanceof CompItem) && !(item instanceof FootageItem)) return;
             if (ctx.graph.reach.has(item.id)) return;
             var nameLower = U.safe(function () { return item.name.toLowerCase(); }, "");
             if (opts.protectExpressions && protectedNames.has(nameLower)) {
-                plan.skips.push({ itemName: item.name, reason: "referenced by an expression — protected" });
+                skips.push({ itemName: item.name, reason: "referenced by an expression — protected" });
                 return;
             }
+            found.push(item);
+        });
+        return { items: found, skips: skips };
+    }
+
+    // Removes every unused item from the project panel, regardless of where its file lives.
+    // Never touches disk — see buildRemoveFromDiskPlan for that.
+    function buildRemoveFromProjectPlan(ctx, opts) {
+        var plan = { kind: "removeProject", removals: [], skips: [], stampNumItems: ctx.stampNumItems, stampAep: ctx.stampAep };
+        var found = findUnusedItems(ctx, opts);
+        plan.skips = found.skips;
+        U.each(found.items, function (item) {
             plan.removals.push({ item: item, itemName: item.name, kind: item instanceof CompItem ? "comp" : "footage", fromPath: Proj.folderPathOf(item) });
         });
+        plan.totals = { removals: plan.removals.length, skips: plan.skips.length };
+        return plan;
+    }
 
+    // Deletes unused footage from disk AND removes it from the project panel, but ONLY for files
+    // that live inside the current project's own folder. Footage still pointing at an imported
+    // project's folder is left untouched entirely (not removed from the panel, not deleted) — that
+    // source project owns those files, and this tool's convention is to copy such footage in
+    // (Rehouse Used) rather than delete it out from under the other project. Unused comps have no
+    // disk file and are likewise left alone here — use Remove Unused from Project for those.
+    function buildRemoveFromDiskPlan(ctx, opts) {
+        var plan = { kind: "removeDisk", removals: [], skips: [], stampNumItems: ctx.stampNumItems, stampAep: ctx.stampAep };
+        var found = findUnusedItems(ctx, opts);
+        plan.skips = found.skips;
+        U.each(found.items, function (item) {
+            if (!(item instanceof FootageItem) || Proj.sourceKind(item) !== "file") {
+                plan.skips.push({ itemName: item.name, reason: "no disk file — use Remove Unused from Project" });
+                return;
+            }
+            var f = Proj.itemFile(item);
+            if (!f || !f.exists) {
+                plan.skips.push({ itemName: item.name, reason: "no disk file — use Remove Unused from Project" });
+                return;
+            }
+            if (!Fs.isInside(f, ctx.projRoot)) {
+                plan.skips.push({ itemName: item.name, reason: "file is outside the project folder — left untouched" });
+                return;
+            }
+            var seq = Seq.detect(item);
+            var diskFiles = seq ? seq.members : [f];
+            plan.removals.push({
+                item: item, itemName: item.name, kind: "footage", fromPath: Proj.folderPathOf(item),
+                diskFiles: diskFiles,
+                diskNote: diskFiles.length > 1 ? ("delete " + diskFiles.length + " file(s) on disk") : "delete file on disk"
+            });
+        });
         plan.totals = { removals: plan.removals.length, skips: plan.skips.length };
         return plan;
     }
@@ -866,6 +1004,7 @@
 
         runRehouseProject: function (plan, diskResult) {
             var result = { relinked: 0, moved: 0, errors: [] };
+            var folderCache = {}; // resolveFolderSpec memo — this is where panel folders actually get created
             app.beginUndoGroup(SCRIPT_NAME + " — Rehouse Used");
             try {
                 U.each(plan.relinks, function (r) {
@@ -874,7 +1013,7 @@
                     else result.errors.push(r.item.name + ": relink failed");
                 });
                 U.each(plan.panelMoves, function (m) {
-                    try { m.item.parentFolder = m.targetFolder; result.moved++; }
+                    try { m.item.parentFolder = resolveFolderSpec(m.targetFolder, folderCache); result.moved++; }
                     catch (e) { result.errors.push(m.itemName + ": " + e.toString()); }
                 });
                 Exec.sweepEmptyFolders();
@@ -884,9 +1023,39 @@
             return result;
         },
 
-        runRemove: function (plan) {
+        runRemoveFromProject: function (plan) {
             var result = { removed: 0, errors: [] };
-            app.beginUndoGroup(SCRIPT_NAME + " — Remove Unused");
+            app.beginUndoGroup(SCRIPT_NAME + " — Remove Unused from Project");
+            try {
+                for (var i = plan.removals.length - 1; i >= 0; i--) {
+                    var r = plan.removals[i];
+                    try { r.item.remove(); result.removed++; }
+                    catch (e) { result.errors.push(r.itemName + ": " + e.toString()); }
+                }
+            } finally {
+                app.endUndoGroup();
+            }
+            return result;
+        },
+
+        runRemoveFromDisk: function (plan) {
+            var result = { removed: 0, filesDeleted: 0, diskErrors: [], errors: [] };
+
+            // Disk deletes happen first and outside the undo group — like Rehouse, disk operations
+            // never participate in AE's undo stack, so panel removal (undoable) always follows
+            // file deletion (not undoable).
+            U.each(plan.removals, function (r) {
+                U.each(r.diskFiles, function (f) {
+                    try {
+                        if (f.exists) {
+                            if (f.remove()) result.filesDeleted++;
+                            else result.diskErrors.push(r.itemName + ": could not delete " + f.fsName);
+                        }
+                    } catch (e) { result.diskErrors.push(r.itemName + ": " + e.toString()); }
+                });
+            });
+
+            app.beginUndoGroup(SCRIPT_NAME + " — Remove Unused from Disk");
             try {
                 for (var i = plan.removals.length - 1; i >= 0; i--) {
                     var r = plan.removals[i];
@@ -915,6 +1084,12 @@
     };
 
     // ------------------------------------------------------------------- UI
+
+    function describeError(e) {
+        var s = e.toString();
+        if (e.line) s += "  (line " + e.line + (e.fileName ? ", " + e.fileName : "") + ")";
+        return s;
+    }
 
     function saveOpt(k, v) { try { app.settings.saveSetting(SETTINGS_SECTION, k, v ? "1" : "0"); } catch (e) {} }
     function loadOpt(k, d) {
@@ -946,12 +1121,26 @@
         cbProtectExpr.value = loadOpt("protectExpr", true);
         cbProtectExpr.onClick = function () { saveOpt("protectExpr", cbProtectExpr.value); };
 
+        var cbConsolidate = optsPanel.add("checkbox", undefined, "Reorganize legacy folders into the standard structure (Rehouse Used)");
+        cbConsolidate.value = loadOpt("consolidateFolders", false);
+        cbConsolidate.onClick = function () { saveOpt("consolidateFolders", cbConsolidate.value); };
+
+        var utilRow = win.add("group");
+        utilRow.orientation = "row";
+        utilRow.alignChildren = ["left", "top"];
+        var btnAddCompsFolder = utilRow.add("button", undefined, "Add Main Comps Folder");
+
         var btnRow = win.add("group");
         btnRow.orientation = "row";
         btnRow.alignChildren = ["fill", "top"];
         var btnRehousePreview = btnRow.add("button", undefined, "Preview Rehouse Used");
-        var btnRemovePreview = btnRow.add("button", undefined, "Preview Remove Unused");
         var btnRelinkPreview = btnRow.add("button", undefined, "Preview Fix Broken Links");
+
+        var removeBtnRow = win.add("group");
+        removeBtnRow.orientation = "row";
+        removeBtnRow.alignChildren = ["fill", "top"];
+        var btnRemoveProjectPreview = removeBtnRow.add("button", undefined, "Preview Remove Unused from Project");
+        var btnRemoveDiskPreview = removeBtnRow.add("button", undefined, "Preview Remove Unused from Disk");
 
         var listBox = win.add("listbox", undefined, [], {
             numberOfColumns: 3, showHeaders: true,
@@ -1009,7 +1198,9 @@
                 });
                 U.each(plan.relinks, function (r) { addRow("RELINK", r.item.name, "→ " + r.destFile.fsName); });
                 U.each(plan.panelMoves, function (m) {
-                    addRow("PANEL", m.itemName, (m.fromPath || "(root)") + "  →  " + Proj.folderFullPath(m.targetFolder));
+                    var detail = (m.fromPath || "(root)") + "  →  " + specPath(m.targetFolder);
+                    if (m.legacy) detail += "  [legacy folder]";
+                    addRow("PANEL", m.itemName, detail);
                 });
                 U.each(plan.skips, function (s) { addRow("SKIP", s.itemName, s.reason); });
                 U.each(plan.warnings, function (w) { addRow("WARN", "", w); });
@@ -1017,10 +1208,15 @@
                     plan.totals.copyItems + " to copy/move (" + U.fmtBytes(plan.totals.copyBytes) + "), " +
                     plan.totals.relinks + " relinks, " + plan.totals.panelMoves + " panel moves, " +
                     plan.totals.skips + " skipped.";
-            } else if (plan.kind === "remove") {
+            } else if (plan.kind === "removeProject") {
                 U.each(plan.removals, function (r) { addRow("REMOVE", r.itemName, r.kind + " — " + (r.fromPath || "(root)")); });
                 U.each(plan.skips, function (s) { addRow("SKIP", s.itemName, s.reason); });
                 summary.text = plan.totals.removals + " item(s) will be removed from the project panel. Nothing on disk is touched.";
+            } else if (plan.kind === "removeDisk") {
+                U.each(plan.removals, function (r) { addRow("DELETE", r.itemName, (r.fromPath || "(root)") + "  —  " + r.diskNote); });
+                U.each(plan.skips, function (s) { addRow("SKIP", s.itemName, s.reason); });
+                summary.text = plan.totals.removals + " file(s) inside the project folder will be deleted from disk and removed from the panel. " +
+                    plan.totals.skips + " skipped (outside project folder, no disk file, or protected).";
             } else if (plan.kind === "relink") {
                 U.each(plan.relinks, function (r) {
                     var label = r.isSeq ? ("FOUND ×" + r.memberCount) : "FOUND";
@@ -1032,32 +1228,48 @@
                 U.each(plan.notFound, function (n) { addRow("NOT FOUND", n.itemName, n.reason); });
                 summary.text = plan.totals.relinks + " link(s) will be fixed, " + plan.totals.ambiguous + " ambiguous (skipped), " + plan.totals.notFound + " not found anywhere in the project folder.";
             }
-            btnApply.enabled = (plan.kind === "rehouse")
-                ? (plan.diskCopies.length + plan.relinks.length + plan.panelMoves.length + plan.createDiskFolders.length) > 0
-                : (plan.kind === "remove" ? plan.removals.length > 0 : plan.relinks.length > 0);
+            if (plan.kind === "rehouse") {
+                btnApply.enabled = (plan.diskCopies.length + plan.relinks.length + plan.panelMoves.length + plan.createDiskFolders.length) > 0;
+            } else if (plan.kind === "removeProject" || plan.kind === "removeDisk") {
+                btnApply.enabled = plan.removals.length > 0;
+            } else {
+                btnApply.enabled = plan.relinks.length > 0;
+            }
         }
 
         btnRehousePreview.onClick = function () {
             try {
                 var ctx = buildContext();
                 if (ctx.error) { alert(ctx.error); return; }
-                var plan = buildRehousePlan(ctx, { precompFolders: cbPrecompFolders.value });
+                var plan = buildRehousePlan(ctx, { precompFolders: cbPrecompFolders.value, consolidateFolders: cbConsolidate.value });
                 pendingPlan = plan; pendingKind = "rehouse";
                 renderPlanRows(plan);
             } catch (e) {
-                alert(SCRIPT_NAME + " error while scanning:\n" + e.toString());
+                alert(SCRIPT_NAME + " error while scanning:\n" + describeError(e));
             }
         };
 
-        btnRemovePreview.onClick = function () {
+        btnRemoveProjectPreview.onClick = function () {
             try {
                 var ctx = buildContext();
                 if (ctx.error) { alert(ctx.error); return; }
-                var plan = buildRemovePlan(ctx, { protectExpressions: cbProtectExpr.value });
-                pendingPlan = plan; pendingKind = "remove";
+                var plan = buildRemoveFromProjectPlan(ctx, { protectExpressions: cbProtectExpr.value });
+                pendingPlan = plan; pendingKind = "removeProject";
                 renderPlanRows(plan);
             } catch (e) {
-                alert(SCRIPT_NAME + " error while scanning:\n" + e.toString());
+                alert(SCRIPT_NAME + " error while scanning:\n" + describeError(e));
+            }
+        };
+
+        btnRemoveDiskPreview.onClick = function () {
+            try {
+                var ctx = buildContext();
+                if (ctx.error) { alert(ctx.error); return; }
+                var plan = buildRemoveFromDiskPlan(ctx, { protectExpressions: cbProtectExpr.value });
+                pendingPlan = plan; pendingKind = "removeDisk";
+                renderPlanRows(plan);
+            } catch (e) {
+                alert(SCRIPT_NAME + " error while scanning:\n" + describeError(e));
             }
         };
 
@@ -1070,7 +1282,18 @@
                 pendingPlan = plan; pendingKind = "relink";
                 renderPlanRows(plan);
             } catch (e) {
-                alert(SCRIPT_NAME + " error while scanning:\n" + e.toString());
+                alert(SCRIPT_NAME + " error while scanning:\n" + describeError(e));
+            }
+        };
+
+        btnAddCompsFolder.onClick = function () {
+            try {
+                app.beginUndoGroup(SCRIPT_NAME + " — Add Main Comps Folder");
+                try { Proj.ensureFolder(app.project.rootFolder, CFG.panel.comps); }
+                finally { app.endUndoGroup(); }
+                alert("\"" + CFG.panel.comps + "\" is ready — drop your main comps in there, then run Rehouse Used.");
+            } catch (e) {
+                alert(SCRIPT_NAME + " error creating folder:\n" + describeError(e));
             }
         };
 
@@ -1108,14 +1331,27 @@
                         U.each(projResult.errors, function (e) { msg += "- " + e + "\n"; });
                     }
                     alert(msg);
-                } else if (pendingKind === "remove") {
-                    var remResult = Exec.runRemove(pendingPlan);
+                } else if (pendingKind === "removeProject") {
+                    var remResult = Exec.runRemoveFromProject(pendingPlan);
                     var msg2 = "Removed " + remResult.removed + " item(s) from the project panel.\nNo files were touched on disk.";
                     if (remResult.errors.length) {
                         msg2 += "\n\nErrors:\n";
                         U.each(remResult.errors, function (e) { msg2 += "- " + e + "\n"; });
                     }
                     alert(msg2);
+                } else if (pendingKind === "removeDisk") {
+                    var diskRemResult = Exec.runRemoveFromDisk(pendingPlan);
+                    var msg2b = "Deleted " + diskRemResult.filesDeleted + " file(s) from disk and removed " +
+                        diskRemResult.removed + " item(s) from the project panel.";
+                    if (diskRemResult.diskErrors.length) {
+                        msg2b += "\n\nDisk errors (" + diskRemResult.diskErrors.length + "):\n";
+                        U.each(diskRemResult.diskErrors, function (e) { msg2b += "- " + e + "\n"; });
+                    }
+                    if (diskRemResult.errors.length) {
+                        msg2b += "\n\nErrors:\n";
+                        U.each(diskRemResult.errors, function (e) { msg2b += "- " + e + "\n"; });
+                    }
+                    alert(msg2b);
                 } else if (pendingKind === "relink") {
                     var relResult = Exec.runRelinkMissing(pendingPlan);
                     var msg3 = "Fixed " + relResult.relinked + " broken link(s).\nNo files were touched on disk.";
@@ -1126,7 +1362,7 @@
                     alert(msg3);
                 }
             } catch (e) {
-                alert(SCRIPT_NAME + " error while applying:\n" + e.toString());
+                alert(SCRIPT_NAME + " error while applying:\n" + describeError(e));
             } finally {
                 clearPreview();
             }
