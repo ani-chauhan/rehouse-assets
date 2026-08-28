@@ -1,5 +1,5 @@
 #target aftereffects
-// Ani Rehouse — After Effects project organizer
+// Rehouse Assets — After Effects project organizer
 //
 // Convention:
 //   Panel:  001 Comps / 002 Pre Comps / 003 Assets (01 Audio, 02 Images, 03 Videos, 04 3D, 05 Other) / 004 Imports
@@ -26,9 +26,9 @@
 
 (function (thisObj) {
 
-    var SCRIPT_NAME = "Ani Rehouse";
+    var SCRIPT_NAME = "Rehouse Assets";
     var SCRIPT_VERSION = "1.0.0";
-    var SETTINGS_SECTION = "AniRehouse";
+    var SETTINGS_SECTION = "RehouseAssets";
 
     // ------------------------------------------------------------------ CFG
 

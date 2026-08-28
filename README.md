@@ -1,4 +1,4 @@
-# Ani Rehouse
+# Rehouse Assets
 
 After Effects ScriptUI panel that organizes a project's panel structure and consolidates
 footage onto disk.
@@ -40,15 +40,18 @@ After Effects loads ScriptUI panels from each version's `Scripts/ScriptUI Panels
 folder. This repo is the source of truth; installed copies are plain file copies (not
 symlinks) at:
 
-- `/Applications/Adobe After Effects 2025/Scripts/ScriptUI Panels/Ani Rehouse.jsx`
-- `/Applications/Adobe After Effects 2026/Scripts/ScriptUI Panels/Ani Rehouse.jsx`
-- `/Users/anirudh.chauhan/Documents/AE Scripts/Ani Rehouse.jsx` (personal reference copy)
+- `/Applications/Adobe After Effects 2025/Scripts/ScriptUI Panels/Rehouse Assets.jsx`
+- `/Applications/Adobe After Effects 2026/Scripts/ScriptUI Panels/Rehouse Assets.jsx`
+- `/Users/anirudh.chauhan/Documents/AE Scripts/Rehouse Assets.jsx` (personal reference copy)
 
-After editing `Ani Rehouse.jsx` here, copy it to those locations to pick up changes in
-AE (the app folders are owned by root, so this needs `sudo`):
+After editing `Rehouse Assets.jsx` here, copy it to those locations to pick up changes
+in AE (the app folders are owned by root, so this needs `sudo`):
 
 ```sh
-sudo cp "Ani Rehouse.jsx" "/Applications/Adobe After Effects 2025/Scripts/ScriptUI Panels/Ani Rehouse.jsx"
-sudo cp "Ani Rehouse.jsx" "/Applications/Adobe After Effects 2026/Scripts/ScriptUI Panels/Ani Rehouse.jsx"
-cp "Ani Rehouse.jsx" "/Users/anirudh.chauhan/Documents/AE Scripts/Ani Rehouse.jsx"
+sudo cp "Rehouse Assets.jsx" "/Applications/Adobe After Effects 2025/Scripts/ScriptUI Panels/Rehouse Assets.jsx"
+sudo cp "Rehouse Assets.jsx" "/Applications/Adobe After Effects 2026/Scripts/ScriptUI Panels/Rehouse Assets.jsx"
+cp "Rehouse Assets.jsx" "/Users/anirudh.chauhan/Documents/AE Scripts/Rehouse Assets.jsx"
 ```
+
+Note: the previously installed copies are still named `Ani Rehouse.jsx` on disk. They
+need to be removed/renamed separately when you sync this version over — see below.
